@@ -1,0 +1,40 @@
+#!/bin/bash
+# Regression cases for ~/.jcode/hooks/git-guardrails. Exit 0 = all pass.
+H=~/.jcode/hooks/git-guardrails; fail=0
+T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+git init -q "$T/own" && git -C "$T/own" remote add origin git@github.com:xenking/jcode.git \
+  && git -C "$T/own" remote add up https://github.com/backnotprop/pstack
+git init -q "$T/foreign" && git -C "$T/foreign" remote add origin https://github.com/someone/else.git
+export JCODE_PUSH_FREEZE_FILE="$T/push-freeze"
+check() { want=$1; cwd=$2; shift 2; printf '%s' "$(jq -n --arg c "$1" '{command:$c}')" | (cd "$cwd" && JCODE_HOOK_CWD="$cwd" JCODE_HOOK_TOOL_NAME=bash $H 2>/dev/null); got=$?; [ "$got" = "$want" ] || { echo "FAIL want=$want got=$got [$cwd]: $1"; fail=1; }; }
+O="$T/own"; F="$T/foreign"
+check 0 $O 'git status'
+check 0 $O 'git push origin main'
+check 0 $O 'git push'
+check 0 $O 'git commit -m "do not git reset --hard here"'
+check 0 $O "echo 'git push --force'"
+check 0 $O 'grep -q "git branch -D" file'
+check 2 $O 'git push --force origin x'
+check 2 $O 'git push -f'
+check 2 $O 'cd x && git reset --hard HEAD~1'
+check 2 $O 'git -C repo clean -fdx'
+check 2 $O 'git branch -D old'
+check 2 $O 'git checkout .'
+check 2 $O 'git restore .'
+check 0 $O 'git checkout ./file.rs'
+# Push only to xenking/* remotes.
+check 2 $O 'git push up main'
+check 2 $O 'git push https://github.com/backnotprop/pstack main'
+check 0 $O 'git push git@github.com:xenking/pstack.git jcode'
+check 2 $F 'git push origin main'
+check 2 $F 'git push'
+check 0 $F "git -C $O push origin HEAD:master"
+check 2 $O "git -C $F push origin main"
+check 2 $O 'cd /tmp && git status; git push up x'
+# Freeze: the user said stop, every push blocks until unfrozen.
+touch "$JCODE_PUSH_FREEZE_FILE"
+check 2 $O 'git push origin main'
+check 0 $O 'git status'
+rm -f "$JCODE_PUSH_FREEZE_FILE"
+check 0 $O 'git push origin main'
+[ $fail = 0 ] && echo "all pass"; exit $fail

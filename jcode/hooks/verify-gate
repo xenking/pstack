@@ -1,0 +1,60 @@
+#!/bin/bash
+# jcode pre_tool gate: a push of code to xenking/jcode or xenking/jcode-desktop
+# needs a passing verify-skill receipt (/verify-jcode, /verify-jcode-desktop)
+# that already contains every file this push changes.
+# Passes: non-push commands, other repos, docs-only ranges (*.md, .jcode/skills),
+# or when the user created the skip file. Tests: ~/.jcode/hooks/verify-gate.test
+case "${JCODE_HOOK_TOOL_NAME:-}" in bash|Bash) ;; *) exit 0 ;; esac
+COMMAND=$(jq -r '.command // .tool_input.command // empty' 2>/dev/null)
+[ -n "$COMMAND" ] || exit 0
+SKIP="${JCODE_PUSH_VERIFY_SKIP_FILE:-$HOME/.jcode/push-verify-skip}"
+ROOTS="${JCODE_VERIFY_EVIDENCE_ROOTS:-$HOME/.jcode/scratch:$HOME/.jcode/verification-evidence}"
+GATED_RE='github\.com[:/]+xenking/jcode(-desktop)?(\.git)?$'
+STRIPPED=$(printf '%s' "$COMMAND" | perl -0pe "s/<<-?\\s*'?(\\w+)'?.*?^\\1\$//gms; s/'[^']*'//g; s/\"(\\\\.|[^\"\\\\])*\"//g")
+printf '%s' "$STRIPPED" | grep -qE '(^|[;&|(]|\n)[[:space:]]*git([[:space:]]+-C[[:space:]]+[^[:space:]]+)*[[:space:]]+push([[:space:]]|$)' || exit 0
+[ -e "$SKIP" ] && exit 0
+block() { echo "BLOCKED by verify-gate: $1" >&2; exit 2; }
+
+receipt_heads() {
+  local top=$1 run dir
+  { IFS=:; for r in $ROOTS; do ls -d "$r"/*/run.json 2>/dev/null; done; ls -d "$top"/target/*/run.json 2>/dev/null; } | while read -r run; do
+    dir=$(dirname "$run")
+    if jq -e '.cleaned == true' "$run" >/dev/null 2>&1 \
+      && cat "$dir"/drive-*.json 2>/dev/null | jq -se 'map(select(.status=="passed")) | length > 0' >/dev/null 2>&1; then
+      jq -r '.repo_head // empty' "$run"
+    fi
+    if jq -e '.phase == "cleaned"' "$run" >/dev/null 2>&1 \
+      && cat "$dir"/*-proof.json 2>/dev/null | jq -se 'map(select(.passed==true)) | length > 0' >/dev/null 2>&1; then
+      jq -r --arg t "$top" --arg r "$(cd "$top" && pwd -P)" '.sources | to_entries[] | select(.key == $t or .key == $r or (.key|sub("^/private";"")) == ($t|sub("^/private";""))) | .value.head // empty' "$run"
+    fi
+  done
+}
+
+dir="${JCODE_HOOK_CWD:-$PWD}"
+while IFS= read -r seg || [ -n "$seg" ]; do
+  read -r -a w <<<"$seg"; [ ${#w[@]} -gt 0 ] || continue
+  if [ "${w[0]}" = cd ]; then t="${w[1]:-$HOME}"; t="${t/#\~/$HOME}"; case "$t" in /*) dir="$t" ;; *) dir="$dir/$t" ;; esac; continue; fi
+  [ "${w[0]}" = git ] || continue
+  i=1; repo="$dir"
+  while [ "${w[$i]:-}" = -C ]; do t="${w[$((i+1))]}"; t="${t/#\~/$HOME}"; case "$t" in /*) repo="$t" ;; *) repo="$repo/$t" ;; esac; i=$((i+2)); done
+  [ "${w[$i]:-}" = push ] || continue
+  remote=origin
+  for ((j=i+1; j<${#w[@]}; j++)); do case "${w[$j]}" in -*) ;; *) remote="${w[$j]}"; break ;; esac; done
+  url=$(git -C "$repo" remote get-url --push "$remote" 2>/dev/null || echo "$remote")
+  printf '%s' "$url" | grep -qE "$GATED_RE" || continue
+  top=$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null) || continue
+  base=$(git -C "$repo" rev-parse -q --verify '@{u}' 2>/dev/null \
+    || git -C "$repo" rev-parse -q --verify "$remote/master" 2>/dev/null \
+    || git -C "$repo" rev-parse -q --verify "$remote/main" 2>/dev/null)
+  [ -n "$base" ] || block "cannot find the upstream of $top to compute what this push changes. Fetch first."
+  files=$(git -C "$repo" diff --name-only "$base" HEAD -- . ':(exclude)*.md' ':(exclude).jcode/skills/**')
+  [ -n "$files" ] || continue
+  ok=""
+  for h in $(receipt_heads "$top" | sort -u); do
+    git -C "$repo" cat-file -e "$h^{commit}" 2>/dev/null || continue
+    # shellcheck disable=SC2086
+    if git -C "$repo" diff --quiet "$h" HEAD -- $files; then ok=$h; break; fi
+  done
+  [ -n "$ok" ] || block "push to $url changes code ($(echo "$files" | head -3 | tr '\n' ' ')...) with no passing verify receipt covering it. Run /verify-jcode (or /verify-jcode-desktop) on HEAD, drive the changed feature, clean up, then push. Docs-only pushes are exempt."
+done < <(printf '%s' "$STRIPPED" | perl -pe 's/(&&|\|\||[;&|(\n])/\n/g')
+exit 0

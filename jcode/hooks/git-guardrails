@@ -1,0 +1,70 @@
+#!/bin/bash
+# jcode pre_tool gate adapted from mattpocock/skills misc/git-guardrails-claude-code.
+# Blocks destructive git commands in bash tool calls (exit 2 = block).
+# Matches only at command position (start, or after ; & | ( && ||), so quoted text,
+# commit messages and heredocs mentioning these commands are not blocked.
+# Push policy: force pushes are blocked; a plain push is allowed only to a
+# github.com/xenking/* remote, and never while the push freeze file exists.
+# Tests: ~/.jcode/hooks/git-guardrails.test
+case "${JCODE_HOOK_TOOL_NAME:-}" in bash|Bash) ;; *) exit 0 ;; esac
+COMMAND=$(jq -r '.command // .tool_input.command // empty' 2>/dev/null)
+[ -n "$COMMAND" ] || exit 0
+FREEZE="${JCODE_PUSH_FREEZE_FILE:-$HOME/.jcode/push-freeze}"
+OWN_RE='github\.com[:/]+xenking/'
+# Drop quoted strings and heredoc bodies before matching.
+STRIPPED=$(printf '%s' "$COMMAND" | perl -0pe "s/<<-?\\s*'?(\\w+)'?.*?^\\1\$//gms; s/'[^']*'//g; s/\"(\\\\.|[^\"\\\\])*\"//g")
+P='(^|[;&|(]|\n)[[:space:]]*(sudo[[:space:]]+)?git([[:space:]]+-C[[:space:]]+[^[:space:]]+)?[[:space:]]+'
+block() { echo "BLOCKED by git-guardrails: $1" >&2; exit 2; }
+for rule in \
+  "push[^;&|]*(--force|--force-with-lease|[[:space:]]-f([[:space:]]|$)|[[:space:]]\+)" \
+  "reset[[:space:]]+--hard" \
+  "clean[[:space:]]+-[a-zA-Z]*f" \
+  "branch[[:space:]]+-D" \
+  "checkout[[:space:]]+(--[[:space:]]+)?\.([[:space:]]|$)" \
+  "restore[[:space:]]+\.([[:space:]]|$)"; do
+  if printf '%s' "$STRIPPED" | grep -qE "$P$rule"; then
+    block "destructive git command (git $rule). Ask the user to confirm and run it themselves."
+  fi
+done
+
+printf '%s' "$STRIPPED" | grep -qE "${P}push([[:space:]]|$)" || exit 0
+[ -e "$FREEZE" ] && block "pushes are frozen ($FREEZE exists, the user said stop). Commit locally; only the user removes the freeze."
+
+# Resolve every push segment's target remote. Unresolvable targets fail closed.
+dir="${JCODE_HOOK_CWD:-$PWD}"
+while IFS= read -r seg || [ -n "$seg" ]; do
+  read -r -a w <<<"$seg"
+  [ ${#w[@]} -gt 0 ] || continue
+  i=0; [ "${w[0]}" = sudo ] && i=1
+  if [ "${w[$i]}" = cd ]; then
+    t="${w[$((i+1))]:-$HOME}"; t="${t/#\~/$HOME}"
+    case "$t" in /*) dir="$t" ;; *) dir="$dir/$t" ;; esac
+    continue
+  fi
+  [ "${w[$i]}" = git ] || continue
+  i=$((i+1)); repo="$dir"
+  while [ "${w[$i]:-}" = -C ]; do
+    t="${w[$((i+1))]}"; t="${t/#\~/$HOME}"
+    case "$t" in /*) repo="$t" ;; *) repo="$repo/$t" ;; esac
+    i=$((i+2))
+  done
+  [ "${w[$i]:-}" = push ] || continue
+  remote=""
+  for ((j=i+1; j<${#w[@]}; j++)); do
+    case "${w[$j]}" in -*) ;; *) remote="${w[$j]}"; break ;; esac
+  done
+  if [ -z "$remote" ]; then
+    br=$(git -C "$repo" symbolic-ref --short -q HEAD 2>/dev/null)
+    remote=$(git -C "$repo" config "branch.$br.pushRemote" 2>/dev/null \
+      || git -C "$repo" config remote.pushDefault 2>/dev/null \
+      || git -C "$repo" config "branch.$br.remote" 2>/dev/null \
+      || echo origin)
+  fi
+  case "$remote" in
+    *:*|*/*) url="$remote" ;;
+    *) url=$(git -C "$repo" remote get-url --push "$remote" 2>/dev/null) ;;
+  esac
+  printf '%s' "$url" | grep -qE "$OWN_RE" \
+    || block "push target '$remote' (${url:-unresolved}) in $repo is not a github.com/xenking/* repo. Never push to someone else's repo: fork it to xenking and push there."
+done < <(printf '%s' "$STRIPPED" | perl -pe 's/(&&|\|\||[;&|(\n])/\n/g')
+exit 0

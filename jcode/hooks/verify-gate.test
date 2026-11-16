@@ -1,0 +1,39 @@
+#!/bin/bash
+# Regression cases for ~/.jcode/hooks/verify-gate. Exit 0 = all pass.
+H=~/.jcode/hooks/verify-gate; fail=0
+T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+export JCODE_VERIFY_EVIDENCE_ROOTS="$T/ev" JCODE_PUSH_VERIFY_SKIP_FILE="$T/skip"
+mkdir -p "$T/ev"
+g() { git -C "$T/$1" -c user.email=t@t -c user.name=t "${@:2}" >/dev/null 2>&1; }
+git init -q --bare "$T/remote.git"
+git init -q "$T/jcode"; g jcode remote add origin git@github.com:xenking/jcode.git
+g jcode commit --allow-empty -m base; echo a > "$T/jcode/a.rs"; g jcode add a.rs; g jcode commit -m base2
+git -C "$T/jcode" update-ref refs/remotes/origin/master HEAD
+git -C "$T/jcode" branch -q --set-upstream-to=origin/master 2>/dev/null
+echo b > "$T/jcode/b.rs"; g jcode add b.rs; g jcode commit -m code
+git init -q "$T/other"; g other remote add origin git@github.com:xenking/pstack.git; g other commit --allow-empty -m x
+check() { want=$1; cwd=$2; printf '%s' "$(jq -n --arg c "$3" '{command:$c}')" | (cd "$cwd" && JCODE_HOOK_CWD="$cwd" JCODE_HOOK_TOOL_NAME=bash $H 2>/dev/null); got=$?; [ "$got" = "$want" ] || { echo "FAIL want=$want got=$got: $4"; fail=1; }; }
+J="$T/jcode"; HEAD=$(git -C $J rev-parse HEAD)
+receipt() { mkdir -p "$T/ev/$1"; jq -n --arg h "$2" '{schema:1,repo_head:$h,cleaned:true}' > "$T/ev/$1/run.json"; echo "{\"status\":\"$3\"}" > "$T/ev/$1/drive-001-tui.json"; }
+check 0 $T/other 'git push origin main' "non-gated repo passes"
+check 0 $J 'git status' "non-push passes"
+check 2 $J 'git push origin HEAD:master' "code push without receipt blocks"
+receipt r1 "$HEAD" failed
+check 2 $J 'git push origin HEAD:master' "failed drive does not count"
+receipt r2 "$(git -C $J rev-parse HEAD~1)" passed
+check 2 $J 'git push origin HEAD:master' "receipt for a commit missing the pushed change blocks"
+receipt r3 "$HEAD" passed
+check 0 $J 'git push origin HEAD:master' "receipt on HEAD passes"
+echo c > "$J/c.rs"; g jcode add c.rs; g jcode commit -m more
+check 2 $J 'git push origin HEAD:master' "new code after receipt blocks"
+rm -rf "$T/ev"/*
+echo d > "$J/README.md"; g jcode add README.md; g jcode commit -m docs
+git -C $J update-ref refs/remotes/origin/master HEAD~1
+check 0 $J 'git push origin HEAD:master' "docs-only range passes"
+git -C $J update-ref refs/remotes/origin/master HEAD~3
+touch "$T/skip"
+check 0 $J 'git push origin HEAD:master' "user skip file passes"
+rm -f "$T/skip"
+mkdir -p "$T/ev/desk"; jq -n --arg h "$(git -C $J rev-parse HEAD)" --arg r "$J" '{schema:1,phase:"cleaned",sources:{($r):{head:$h}}}' > "$T/ev/desk/run.json"; echo '{"journey":"tools","passed":true}' > "$T/ev/desk/tools-proof.json"
+check 0 $J 'git push origin HEAD:master' "desktop-shaped receipt passes"
+[ $fail = 0 ] && echo "all pass"; exit $fail
