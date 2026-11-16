@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Sync pstack (xenking/pstack, branch jcode) into ~/.jcode/skills.
+# Idempotent. Copies each skill, renames names that collide with existing
+# skills, and points every skill at the jcode harness adapter.
+# Usage: sync-pstack-skills [--pull]
+set -euo pipefail
+
+PSTACK="${PSTACK_DIR:-$HOME/.jcode/pstack}"
+DEST="$HOME/.jcode/skills"
+ADAPTER="$PSTACK/docs/harness/jcode.md"
+MARK=".pstack-upstream"
+
+rename() { case $1 in tdd) echo tdd-bugfix ;; teach) echo teach-work ;; *) echo "$1" ;; esac; }
+
+if [[ "${1:-}" == "--pull" ]]; then
+  git -C "$PSTACK" fetch -q origin
+  git -C "$PSTACK" merge -q --no-edit origin/main
+fi
+[[ -f "$ADAPTER" ]] || { echo "missing $ADAPTER" >&2; exit 1; }
+rev=$(git -C "$PSTACK" rev-parse HEAD)
+
+for src in "$PSTACK"/skills/*; do
+  name=$(basename "$src")
+  target=$(rename "$name")
+  dst="$DEST/$target"
+  if [[ -e "$dst" && ! -f "$dst/$MARK" ]]; then
+    echo "skip $target: exists and is not pstack-managed" >&2
+    continue
+  fi
+  rm -rf "$dst"
+  cp -R "$src" "$dst"
+  echo "$rev $name" > "$dst/$MARK"
+  md="$dst/SKILL.md"
+  [[ "$target" == "$name" ]] || sed -i '' "1,/^---\$/s/^name: $name\$/name: $target/" "$md"
+  awk -v a="$ADAPTER" '
+    NR==1 && $0=="---" {fm=1; print; next}
+    fm && $0=="---" {print; print ""; print "> jcode: read `" a "` first. It maps Cursor tools, subagents, models and paths to jcode."; fm=0; next}
+    {print}' "$md" > "$md.tmp" && mv "$md.tmp" "$md"
+  for k in tdd teach; do
+    { grep -rl "\.\./$k/SKILL.md" "$dst" 2>/dev/null || true; } | while read -r f; do
+      sed -i '' "s#\.\./$k/SKILL.md#../$(rename $k)/SKILL.md#g" "$f"
+    done
+  done
+done
+
+for d in "$DEST"/*/; do
+  [[ -f "$d/$MARK" ]] || continue
+  orig=$(awk '{print $2}' "$d/$MARK")
+  [[ -d "$PSTACK/skills/$orig" ]] || { rm -rf "$d"; echo "removed $(basename "$d")"; }
+done
+echo "pstack ${rev:0:12} synced into $DEST"
