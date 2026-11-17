@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Tests for sync-pstack-skills against throwaway git repos. No network.
+set -uo pipefail
+S="$(cd "$(dirname "$0")" && pwd)/sync-pstack-skills"
+T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+pass=0 fail=0
+ok() { echo "ok   $1"; pass=$((pass+1)); }
+no() { echo "FAIL $1"; fail=$((fail+1)); }
+g() { git -C "$@"; }
+gc() { git -C "$1" -c user.name=t -c user.email=t@t -c commit.gpgsign=false "${@:2}"; }
+
+skill() { mkdir -p "$1/skills/$2"; printf -- '---\nname: %s\ndescription: d\n---\n%s\n' "$2" "${3:-body}" > "$1/skills/$2/SKILL.md"; }
+
+# upstream: main with two skills; fork: jcode branch adds the adapter
+U=$T/up; git init -q -b main $U; skill $U alpha; skill $U tdd
+gc $U add -A; gc $U commit -qm base
+P=$T/pstack; git clone -q $U $P; g $P checkout -qb jcode
+mkdir -p $P/docs/harness $P/jcode/hooks; echo adapter > $P/docs/harness/jcode.md; echo hook > $P/jcode/hooks/h
+gc $P add -A; gc $P commit -qm adapter
+git -C $P config user.name t; git -C $P config user.email t@t; git -C $P config commit.gpgsign false
+D=$T/skills; mkdir -p $D/mine; echo keep > $D/mine/SKILL.md
+H=$T/hooks; mkdir -p $H; echo hook > $H/h
+export PSTACK_DIR=$P PSTACK_DEST=$D PSTACK_HOOKS_DIR=$H PSTACK_NO_PUSH=1
+run() { "$S" "$@" > $T/out 2>&1; echo $?; }
+
+[[ $(run) == 0 && -f $D/alpha/SKILL.md && -f $D/tdd-bugfix/SKILL.md && ! -e $D/tdd ]] && ok "installs and renames colliding skill" || no "install"
+grep -q 'name: tdd-bugfix' $D/tdd-bugfix/SKILL.md && grep -q 'harness/jcode.md' $D/alpha/SKILL.md && ok "rewrites name and adapter pointer" || no "rewrite"
+[[ $(cat $D/mine/SKILL.md) == keep ]] && ok "leaves unmanaged skills alone" || no "unmanaged"
+run >/dev/null; grep -qE "added|changed" $T/out && no "second run is a no-op" || ok "second run is a no-op"
+
+skill $U beta; gc $U add -A; gc $U commit -qm beta
+[[ $(run --pull) == 0 && -f $D/beta/SKILL.md ]] && grep -q "added: beta" $T/out && ok "pull merges upstream and reports new skill" || no "pull new"
+
+git -C $U rm -qr skills/beta; gc $U commit -qm drop
+run --pull >/dev/null; [[ ! -e $D/beta ]] && grep -q "removed: beta" $T/out && ok "removes skills dropped upstream" || no "remove"
+
+echo local > $P/docs/harness/jcode.md; gc $P commit -qam local
+echo upstream > $U/docs.md; mkdir -p $U/docs/harness; echo theirs > $U/docs/harness/jcode.md; gc $U add -A; gc $U commit -qm conflict
+before=$(g $P rev-parse HEAD); snap=$(cat $D/alpha/SKILL.md)
+[[ $(run --pull) == 2 ]] && grep -q "conflicts in: docs/harness/jcode.md" $T/out && ok "merge conflict exits 2 and names the file" || no "conflict"
+[[ $(g $P rev-parse HEAD) == "$before" && -z "$(g $P status --porcelain)" && "$(cat $D/alpha/SKILL.md)" == "$snap" ]] && ok "conflict leaves repo and skills untouched" || no "conflict rollback"
+gc $U revert --no-edit HEAD >/dev/null
+run --pull >/dev/null; grep -q "synced" $T/out && ok "recovers after upstream resolves the conflict" || no "recover after conflict"
+
+skill $U broken; sed -i '' 's/^name: broken/name: wrong/' $U/skills/broken/SKILL.md; gc $U add -A; gc $U commit -qm broken
+snap=$(cat $D/alpha/SKILL.md)
+[[ $(run --pull) == 1 && ! -e $D/broken ]] && grep -q "does not match" $T/out && ok "invalid upstream skill aborts before install" || no "validation"
+[[ -z "$(g $P status --porcelain)" && ! -e $P/skills/broken ]] && ok "invalid upstream merge is rolled back" || no "validation rollback"
+git -C $U rm -qr skills/broken; gc $U commit -qm unbreak
+
+echo dirty > $P/x; [[ $(run) == 1 ]] && grep -q "uncommitted" $T/out && ok "refuses a dirty checkout" || no "dirty"; rm $P/x
+g $P checkout -q main; [[ $(run) == 1 ]] && grep -q "not on branch jcode" $T/out && ok "refuses wrong branch" || no "branch"; g $P checkout -q jcode
+
+echo changed > $H/h; run >/dev/null; grep -q "hook drift vs ~/.jcode/hooks: h" $T/out && ok "reports hook drift" || no "drift"
+
+echo "$pass passed, $fail failed"; [[ $fail == 0 ]]

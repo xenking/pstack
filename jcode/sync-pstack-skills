@@ -1,36 +1,74 @@
 #!/usr/bin/env bash
 # Sync pstack (xenking/pstack, branch jcode) into ~/.jcode/skills.
-# Idempotent. Copies each skill, renames names that collide with existing
-# skills, and points every skill at the jcode harness adapter.
-# Usage: sync-pstack-skills [--pull]
+#
+# Usage: sync-pstack-skills [--pull] [--push] [--notify]
+#   --pull    merge upstream backnotprop/pstack main into the jcode branch first
+#   --push    push the jcode branch to xenking/pstack after a clean sync
+#   --notify  macOS notification when something changed or failed
+#
+# Safe to run unattended (launchd: com.xenking.pstack-sync):
+# - never touches a dirty checkout or a branch other than `jcode`
+# - a merge conflict is aborted, nothing is installed, exit 2
+# - skills are staged and validated before ~/.jcode/skills changes
+# - only skills carrying the .pstack-upstream marker are ever replaced/removed
+# Env overrides (tests): PSTACK_DIR, PSTACK_DEST, PSTACK_HOOKS_DIR, PSTACK_NO_PUSH.
 set -euo pipefail
 
 PSTACK="${PSTACK_DIR:-$HOME/.jcode/pstack}"
-DEST="$HOME/.jcode/skills"
+DEST="${PSTACK_DEST:-$HOME/.jcode/skills}"
+HOOKS="${PSTACK_HOOKS_DIR:-$HOME/.jcode/hooks}"
 ADAPTER="$PSTACK/docs/harness/jcode.md"
 MARK=".pstack-upstream"
+PULL=0 PUSH=0 NOTIFY=0
+for a in "$@"; do
+  case $a in --pull) PULL=1 ;; --push) PUSH=1 ;; --notify) NOTIFY=1 ;;
+  *) echo "unknown flag $a" >&2; exit 64 ;; esac
+done
+
+log() { echo "$(date '+%F %T') $*"; }
+notify() {
+  [[ $NOTIFY == 1 ]] || return 0
+  osascript -e "display notification \"${1//\"/\'}\" with title \"pstack sync\"" >/dev/null 2>&1 || true
+}
+MERGING=0
+fail() {
+  [[ $MERGING == 1 ]] && git -C "$PSTACK" merge --abort 2>/dev/null
+  log "FAIL: $*"; notify "FAILED: $*"; exit "${2:-1}"
+}
+g() { git -C "$PSTACK" "$@"; }
 
 rename() { case $1 in tdd) echo tdd-bugfix ;; teach) echo teach-work ;; *) echo "$1" ;; esac; }
 
-if [[ "${1:-}" == "--pull" ]]; then
-  git -C "$PSTACK" fetch -q origin
-  git -C "$PSTACK" merge -q --no-edit origin/main
-fi
-[[ -f "$ADAPTER" ]] || { echo "missing $ADAPTER" >&2; exit 1; }
-rev=$(git -C "$PSTACK" rev-parse HEAD)
+[[ "$(g rev-parse --abbrev-ref HEAD)" == jcode ]] || fail "pstack checkout is not on branch jcode"
+[[ -z "$(g status --porcelain)" ]] || fail "pstack checkout has uncommitted changes"
 
-for src in "$PSTACK"/skills/*; do
-  name=$(basename "$src")
-  target=$(rename "$name")
-  dst="$DEST/$target"
-  if [[ -e "$dst" && ! -f "$dst/$MARK" ]]; then
-    echo "skip $target: exists and is not pstack-managed" >&2
-    continue
+before=$(g rev-parse HEAD)
+if [[ $PULL == 1 ]]; then
+  g fetch -q origin || fail "fetch upstream failed"
+  # Merge without committing: the merge only lands after every skill validates.
+  if ! g merge-base --is-ancestor origin/main HEAD; then
+    MERGING=1
+    if ! g merge -q --no-commit --no-ff origin/main >/dev/null 2>&1; then
+      files=$(g diff --name-only --diff-filter=U | tr '\n' ' ')
+      fail "upstream merge conflicts in: $files (resolve by hand in $PSTACK)" 2
+    fi
   fi
-  rm -rf "$dst"
+fi
+rev=$(g rev-parse HEAD)
+[[ -f "$ADAPTER" ]] || fail "missing $ADAPTER"
+
+# Stage every skill, validate, then swap in. A broken upstream skill never
+# replaces a working installed one.
+stage=$(mktemp -d "${TMPDIR:-/tmp}/pstack-stage.XXXXXX")
+trap 'rm -rf "$stage"' EXIT
+for src in "$PSTACK"/skills/*/; do
+  name=$(basename "$src"); target=$(rename "$name"); dst="$stage/$target"
   cp -R "$src" "$dst"
   echo "$rev $name" > "$dst/$MARK"
   md="$dst/SKILL.md"
+  [[ -f "$md" ]] || fail "skill $name has no SKILL.md"
+  head -1 "$md" | grep -qx -- '---' || fail "skill $name has no frontmatter"
+  grep -qE "^name: $name\$" "$md" || fail "skill $name frontmatter name does not match its directory"
   [[ "$target" == "$name" ]] || sed -i '' "1,/^---\$/s/^name: $name\$/name: $target/" "$md"
   awk -v a="$ADAPTER" '
     NR==1 && $0=="---" {fm=1; print; next}
@@ -43,9 +81,47 @@ for src in "$PSTACK"/skills/*; do
   done
 done
 
+if [[ $MERGING == 1 ]]; then
+  g commit -q --no-edit || fail "merge commit failed"
+  MERGING=0
+fi
+rev=$(g rev-parse HEAD)
+for m in "$stage"/*/"$MARK"; do awk -v r="$rev" '{print r, $2}' "$m" > "$m.t" && mv "$m.t" "$m"; done
+
+added=() changed=() skipped=() removed=()
+for dst in "$stage"/*/; do
+  target=$(basename "$dst"); live="$DEST/$target"
+  if [[ -e "$live" && ! -f "$live/$MARK" ]]; then skipped+=("$target"); continue; fi
+  if [[ ! -e "$live" ]]; then added+=("$target")
+  elif ! diff -rq -x "$MARK" "$dst" "$live" >/dev/null 2>&1; then changed+=("$target"); fi
+  rm -rf "$live.pstack-new"; cp -R "$dst" "$live.pstack-new"
+  rm -rf "$live"; mv "$live.pstack-new" "$live"
+done
 for d in "$DEST"/*/; do
   [[ -f "$d/$MARK" ]] || continue
-  orig=$(awk '{print $2}' "$d/$MARK")
-  [[ -d "$PSTACK/skills/$orig" ]] || { rm -rf "$d"; echo "removed $(basename "$d")"; }
+  t=$(basename "$d"); [[ -d "$stage/$t" ]] && continue
+  rm -rf "$d"; removed+=("$t")
 done
-echo "pstack ${rev:0:12} synced into $DEST"
+
+# Hooks in the repo are the published copy of ~/.jcode/hooks. Report drift.
+drift=()
+if [[ -d "$PSTACK/jcode/hooks" && -d "$HOOKS" ]]; then
+  for f in "$PSTACK"/jcode/hooks/*; do
+    b=$(basename "$f")
+    cmp -s "$f" "$HOOKS/$b" || drift+=("$b")
+  done
+fi
+
+if [[ $PUSH == 1 && -z "${PSTACK_NO_PUSH:-}" && "$rev" != "$(g rev-parse xenking/jcode 2>/dev/null || true)" ]]; then
+  g push -q xenking jcode || fail "push to xenking/pstack failed"
+fi
+
+summary="${rev:0:12}"
+[[ "$before" != "$rev" ]] && summary+=" (upstream $(g rev-list --count "$before..$rev") new commits)"
+(( ${#added[@]} )) && summary+=" added: ${added[*]}"
+(( ${#changed[@]} )) && summary+=" changed: ${changed[*]}"
+(( ${#removed[@]} )) && summary+=" removed: ${removed[*]}"
+(( ${#skipped[@]} )) && summary+=" skipped (not pstack-managed): ${skipped[*]}"
+(( ${#drift[@]} )) && summary+=" hook drift vs ~/.jcode/hooks: ${drift[*]}"
+log "pstack $summary synced into $DEST"
+if (( ${#added[@]} + ${#changed[@]} + ${#removed[@]} + ${#drift[@]} )); then notify "$summary"; fi
