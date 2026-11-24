@@ -271,8 +271,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sessions", default=os.path.expanduser("~/.jcode/sessions"))
     ap.add_argument("--since", default="2026-11-01")
+    ap.add_argument("--days", type=int, help="rolling window, overrides --since")
     ap.add_argument("--out", default=os.path.expanduser("~/.jcode/pstack-audit"))
     a = ap.parse_args()
+    if a.days:
+        a.since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=a.days)).strftime("%Y-%m-%d")
     os.makedirs(a.out, exist_ok=True)
     rows = []; turns = []; global_seen = set()
     files = []
