@@ -29,9 +29,9 @@ pstack skills use Cursor names. In jcode, read this file once per session, then 
 
 ## Models
 
-Only the models in `~/.jcode/config.toml` `[agents].swarm_model_allowlist` can be spawned. A spawn with any other model fails, so never pass a Claude or Gemini slug. The role lines live in `~/.agents/pstack-models.md`. Read it at task start. Each value is `<jcode model> <effort>`, such as `openai:gpt-6.1-sol xhigh`. Pass the model as `model`. jcode has no per-spawn effort field. The worker runs at `[agents].swarm_effort`, capped by `swarm_effort_caps`. State the wanted effort in the brief and pick sol for the hardest roles. Drop `-fast` everywhere.
+The spawnable models are exactly the `model` enum of the `swarm` tool, built from `~/.jcode/config.toml` `[agents]` (`swarm_model_allowlist`, `spawn_allowed_models`, and the `swarm_pool` keys). Claude models are spawnable when they are in `swarm_pool`. Any other slug fails. The role lines live in `~/.agents/pstack-models.md`. Read it at task start. Each value is `<jcode model> <effort>`, such as `claude:claude-opus-5-5 xhigh`. Pass the model as `model`. jcode has no per-spawn effort field. The worker runs at `[agents].swarm_effort`, moved to the nearest level its `swarm_pool` entry allows and capped by `swarm_effort_caps`. Use `swarm` `set_model` with `effort` to change a running worker. Drop `-fast` everywhere. A pstack slug such as `claude-opus-5-5-xhigh-fast` maps to `claude:claude-opus-5-5`. Fable and Gemini have no jcode route, so their panel seats take another pool family.
 
-Panel diversity comes from different models in the pool. Where a panel asks for a non-Claude family, use another pool model. The coordinator chat itself is a different family (Claude), so the coordinator's own pass counts as one more panel voice when a skill asks for cross-vendor judgment.
+Panel diversity comes from different families in the pool (Claude, OpenAI, DeepSeek). The coordinator's own pass counts as one more panel voice from whatever family the coordinator runs.
 
 ## Paths
 

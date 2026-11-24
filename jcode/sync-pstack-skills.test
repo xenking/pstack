@@ -20,7 +20,7 @@ gc $P add -A; gc $P commit -qm adapter
 git -C $P config user.name t; git -C $P config user.email t@t; git -C $P config commit.gpgsign false
 D=$T/skills; mkdir -p $D/mine; echo keep > $D/mine/SKILL.md
 H=$T/hooks; mkdir -p $H; echo hook > $H/h
-export PSTACK_DIR=$P PSTACK_DEST=$D PSTACK_HOOKS_DIR=$H PSTACK_NO_PUSH=1
+export PSTACK_DIR=$P PSTACK_DEST=$D PSTACK_HOOKS_DIR=$H PSTACK_NO_PUSH=1 PSTACK_MODELS=$T/none
 run() { "$S" "$@" > $T/out 2>&1; echo $?; }
 
 [[ $(run) == 0 && -f $D/alpha/SKILL.md && -f $D/tdd-bugfix/SKILL.md && ! -e $D/tdd ]] && ok "installs and renames colliding skill" || no "install"
@@ -52,5 +52,13 @@ echo dirty > $P/x; [[ $(run) == 1 ]] && grep -q "uncommitted" $T/out && ok "refu
 g $P checkout -q main; [[ $(run) == 1 ]] && grep -q "not on branch jcode" $T/out && ok "refuses wrong branch" || no "branch"; g $P checkout -q jcode
 
 echo changed > $H/h; run >/dev/null; grep -q "hook drift vs ~/.jcode/hooks: h" $T/out && ok "reports hook drift" || no "drift"
+
+C=$T/config.toml M=$T/models.md
+printf '[agents]\nswarm_model_allowlist = [\n  "openai:new",\n]\nswarm_effort_caps = { "openai:old" = "high" }\nswarm_pool = { "claude:opus" = ["high"] }\n[other]\nx = ["openai:old"]\n' > $C
+printf '# defaults: 3\nbug-fix: openai:old xhigh\njudgment and prose: inherit-parent\narena runners: claude:opus high, openai:new high\n' > $M
+export PSTACK_MODELS=$M PSTACK_JCODE_CONFIG=$C
+run >/dev/null; grep -q "model drift vs swarm pool: bug-fix=openai:old" $T/out && ! grep -q "claude:opus\|openai:new\|inherit" $T/out && ok "reports role models outside the pool only" || no "model drift"
+sed -i '' 's/openai:old/openai:new/; /defaults/d' $M; run >/dev/null; grep -q "rerun /setup-pstack" $T/out && ! grep -q "bug-fix=" $T/out && ok "reports a models file older than defaults 3" || no "defaults line"
+unset PSTACK_MODELS PSTACK_JCODE_CONFIG
 
 echo "$pass passed, $fail failed"; [[ $fail == 0 ]]

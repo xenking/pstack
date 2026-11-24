@@ -112,6 +112,47 @@ if [[ -d "$PSTACK/jcode/hooks" && -d "$HOOKS" ]]; then
   done
 fi
 
+# Every role model must be spawnable. A pool change silently breaks each role
+# that still names a retired model, so name them.
+MODELS="${PSTACK_MODELS:-$HOME/.agents/pstack-models.md}"
+CONFIG="${PSTACK_JCODE_CONFIG:-$HOME/.jcode/config.toml}"
+model_drift=()
+if [[ -f "$MODELS" && -f "$CONFIG" ]]; then
+  while IFS= read -r m; do [[ -n $m ]] && model_drift+=("$m"); done < <(/usr/bin/env python3 - "$MODELS" "$CONFIG" <<'PY'
+import re, sys
+models, config = sys.argv[1:3]
+ok, section, key = set(), "", ""
+for line in open(config):
+    s = line.split("#", 1)[0].strip()
+    if s.startswith("["):
+        section, key = s, ""
+        continue
+    if section != "[agents]":
+        continue
+    m = re.match(r"([a-z_]+)\s*=", s)
+    if m:
+        key = m.group(1)
+    if key in ("swarm_model_allowlist", "spawn_allowed_models"):
+        ok.update(re.findall(r'"([^"]+)"', s))
+    elif key == "swarm_pool":
+        ok.update(re.findall(r'"([^"]+)"\s*=', s))
+    if s.endswith(("]", "}")):
+        key = ""
+text = open(models).read()
+if "# defaults: 3" not in text:
+    print("no '# defaults: 3' line (rerun /setup-pstack)")
+for line in text.splitlines():
+    if line.startswith("#") or ": " not in line:
+        continue
+    role, vals = line.split(": ", 1)
+    for v in vals.split(","):
+        model = v.split()[0] if v.split() else ""
+        if model and model not in ("inherit-parent", "auto") and model not in ok:
+            print(f"{role}={model}")
+PY
+)
+fi
+
 if [[ $PUSH == 1 && -z "${PSTACK_NO_PUSH:-}" && "$rev" != "$(g rev-parse xenking/jcode 2>/dev/null || true)" ]]; then
   g push -q xenking jcode || fail "push to xenking/pstack failed"
 fi
@@ -123,5 +164,6 @@ summary="${rev:0:12}"
 (( ${#removed[@]} )) && summary+=" removed: ${removed[*]}"
 (( ${#skipped[@]} )) && summary+=" skipped (not pstack-managed): ${skipped[*]}"
 (( ${#drift[@]} )) && summary+=" hook drift vs ~/.jcode/hooks: ${drift[*]}"
+(( ${#model_drift[@]} )) && summary+=" model drift vs swarm pool: ${model_drift[*]}"
 log "pstack $summary synced into $DEST"
-if (( ${#added[@]} + ${#changed[@]} + ${#removed[@]} + ${#drift[@]} )); then notify "$summary"; fi
+if (( ${#added[@]} + ${#changed[@]} + ${#removed[@]} + ${#drift[@]} + ${#model_drift[@]} )); then notify "$summary"; fi
