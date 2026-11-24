@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""Measure how poteto-mode sessions in jcode match pstack's own success criteria.
+
+Usage: audit-poteto-sessions [--sessions DIR] [--since YYYY-MM-DD] [--out DIR]
+
+Reads ~/.jcode/sessions/session_*.json plus their *.journal.jsonl tails, keeps
+sessions where poteto-mode was active (pinned, activated, or a worker kickoff
+naming poteto-mode), and writes:
+  <out>/sessions.jsonl   one metrics record per session
+  <out>/user_turns.jsonl every real user message with its session and index
+  <out>/summary.md       aggregate table per criterion
+Read-only on the session store.
+"""
+import argparse, collections, datetime as dt, glob, json, os, re, statistics, sys
+
+SR = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+POTETO_ACTIVE = re.compile(r"Active modes?: [^\n]*poteto-mode")
+CORRECTION = re.compile(
+    r"(^|\W)(нет[,. ]|не так|не то|неправ|опять|снова|зачем|почему ты|почему не|я же|я просил|"
+    r"просил|не надо|не нужно|хватит|стоп|остановись|stop\b|wrong|why did|не работает|сломал|"
+    r"ты не|не сделал|где [а-я]+\?|всё ещё|все еще|до сих пор)", re.I)
+VERIFY_BASH = re.compile(
+    r"(justrust (test|check|clippy)|cargo (test|check|clippy|nextest)|scripts/check_|"
+    r"scripts/accept-|pytest|bun test|npm (run )?test|\.test\b|go test|--socket|jcode run|"
+    r"mcp test|xcodebuild|swift test)")
+VERIFY_TOOLS = {"debug_socket", "browser", "macos_computer_use", "desktop"}
+RUNTIME_BASH = re.compile(r"(--socket|jcode run|mcp test|scripts/accept-|JCODE_HOME=|skills/verify-jcode)")
+VERIFY_SKILL_CLI = re.compile(r"skills/verify-jcode(-desktop)?/scripts/|\$V\" (launch|drive|doctor)")
+DETERMINISTIC_PATH = re.compile(r"(scripts/check_|/tests?/|_test\.|\.test\b|test_|lint|clippy\.toml|\.github/workflows|/hooks/)")
+DESCRIPTIVE_PATH = re.compile(r"(AGENTS\.md|CLAUDE\.md|SKILL\.md|/skills/|\.mdc?$)")
+PRINCIPLE_READ = re.compile(r"principle-([a-z0-9-]+)/SKILL\.md")
+PLAYBOOK_READ = re.compile(r"playbooks/([a-z0-9-]+)\.md")
+SYNTHETIC_TURN = re.compile(
+    r"^(You have \d+ incomplete|\U0001f41d|\[auto\]|\*\*Background task|\[Background Task|\S+ edited \S|\[swarm|\[Swarm|"
+    r"\*\*Swarm|Swarm |Reassess the user's request|Review the request again|Perform one final, indep)")
+
+
+def load(path, global_seen):
+    """Return the session with only messages no earlier session already owns.
+
+    Forked and resumed sessions copy their parent's history, so counting every
+    copy would multiply the same user turns and tool calls."""
+    try:
+        d = json.load(open(path))
+    except Exception:
+        return None
+    msgs = list(d.get("messages") or [])
+    seen = {m.get("id") for m in msgs}
+    j = path[:-5] + ".journal.jsonl"
+    if os.path.exists(j):
+        for line in open(j, errors="replace"):
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            for m in o.get("append_messages") or []:
+                if m.get("id") not in seen:
+                    seen.add(m.get("id")); msgs.append(m)
+    d["all_messages"] = msgs
+    d["messages"] = [m for m in msgs if m.get("id") not in global_seen]
+    global_seen.update(m.get("id") for m in msgs)
+    return d
+
+
+def parts(m):
+    c = m.get("content")
+    return c if isinstance(c, list) else [{"type": "text", "text": str(c or "")}]
+
+
+def text_of(m):
+    return "\n".join(p.get("text", "") for p in parts(m) if p.get("type") == "text")
+
+
+def ts(m):
+    t = m.get("timestamp")
+    try:
+        return dt.datetime.fromisoformat(t.replace("Z", "+00:00")) if t else None
+    except Exception:
+        return None
+
+
+def is_poteto(d):
+    if "poteto-mode" in (d.get("pinned_skills") or []) or d.get("pinned_skill") == "poteto-mode":
+        return "pinned"
+    for m in d["all_messages"][:400]:
+        t = text_of(m)
+        if POTETO_ACTIVE.search(t):
+            return "active"
+        if m.get("role") == "user" and re.search(r"^/poteto-mode\b", SR.sub("", t).strip()):
+            return "command"
+        if m.get("role") == "user" and "poteto-mode/worker.md" in t[:400]:
+            return "worker-kickoff"
+    return None
+
+
+def user_turns(d):
+    out = []
+    for i, m in enumerate(d["messages"]):
+        if m.get("role") != "user" or m.get("display_role") == "system":
+            continue
+        if any(p.get("type") == "tool_result" for p in parts(m)):
+            continue
+        t = SR.sub("", text_of(m)).strip()
+        t = re.sub(r"^\[\d{4}-\d\d-\d\dT[^\]]+\]\s*", "", t)
+        if t and not SYNTHETIC_TURN.match(t):
+            out.append((i, t, m))
+    return out
+
+
+def analyze(path, d, kind):
+    msgs = d["messages"]
+    tools = collections.Counter(); errors = collections.Counter()
+    spawns = []; spawn_fail = 0; spawn_models = collections.Counter()
+    verify_calls = runtime_calls = 0; principles = set(); playbooks = set()
+    harness_read = worker_first_line = 0; edits_det = edits_desc = edits_other = 0
+    commits = pushes = 0; asks = 0; todo_calls = 0; verify_cli = 0
+    tok_in = tok_out = tok_cache = 0
+    id2name = {}
+    em_dash = 0; final_reply = ""
+    for m in msgs:
+        tu = m.get("token_usage") or {}
+        tok_in += tu.get("input_tokens") or 0
+        tok_out += tu.get("output_tokens") or 0
+        tok_cache += tu.get("cache_read_input_tokens") or 0
+        for p in parts(m):
+            t = p.get("type")
+            if t == "tool_use":
+                name = p.get("name"); inp = p.get("input") or {}
+                id2name[p.get("id")] = (name, inp)
+                calls = [(name, inp)]
+                if name == "batch":
+                    calls = [(c.get("tool") or c.get("name"), c.get("parameters") or c) for c in inp.get("tool_calls") or []]
+                for name, inp in calls:
+                    tools[name] += 1
+                    s = json.dumps(inp, ensure_ascii=False)
+                    if name == "bash":
+                        cmd = inp.get("command", "")
+                        if VERIFY_BASH.search(cmd): verify_calls += 1
+                        if RUNTIME_BASH.search(cmd): runtime_calls += 1
+                        if VERIFY_SKILL_CLI.search(cmd): verify_cli += 1
+                        commits += len(re.findall(r"git (-C \S+ )?commit\b", cmd))
+                        pushes += len(re.findall(r"git (-C \S+ )?push\b", cmd))
+                    if name == "selfdev" and inp.get("action") in ("test", "build", "build-reload", "screenshot", "before-after"):
+                        verify_calls += 1
+                        if inp.get("action") in ("screenshot", "before-after", "build-reload"): runtime_calls += 1
+                    if name in VERIFY_TOOLS:
+                        verify_calls += 1; runtime_calls += 1
+                    if name == "skill_manage" and "verify" in str(inp.get("name", "")):
+                        verify_calls += 1
+                    if name == "read":
+                        fp = inp.get("file_path", "")
+                        if "docs/harness/jcode.md" in fp: harness_read += 1
+                    for x in PRINCIPLE_READ.findall(s if name in ("read", "bash", "skill_manage") else ""): principles.add(x)
+                    for x in PLAYBOOK_READ.findall(s if name in ("read", "bash") else ""): playbooks.add(x)
+                    if name in ("edit", "write", "apply_patch"):
+                        fp = inp.get("file_path", "") or inp.get("patch_text", "")[:2000]
+                        for f in re.findall(r"(?:\*\*\* (?:Update|Add) File: |^)(\S+)", fp, re.M)[:5] or [fp]:
+                            if DETERMINISTIC_PATH.search(f): edits_det += 1
+                            elif DESCRIPTIVE_PATH.search(f): edits_desc += 1
+                            else: edits_other += 1
+                    if name == "swarm" and inp.get("action") == "spawn":
+                        pr = inp.get("prompt") or ""
+                        spawns.append(inp.get("model") or "default")
+                        spawn_models[inp.get("model") or "default"] += 1
+                        if pr.lstrip().startswith("Read ") and "worker.md" in pr.split("\n", 1)[0]: worker_first_line += 1
+                    if name == "ask": asks += 1
+                    if name == "todo": todo_calls += 1
+            elif t == "tool_result" and p.get("is_error"):
+                name, inp = id2name.get(p.get("tool_use_id"), ("?", {}))
+                errors[name] += 1
+                if name == "swarm" and (inp or {}).get("action") == "spawn": spawn_fail += 1
+        if m.get("role") == "assistant":
+            tx = text_of(m)
+            em_dash += tx.count("\u2014")
+            for p in parts(m):
+                if p.get("type") == "tool_use" and p.get("name") == "user_response":
+                    final_reply = (p.get("input") or {}).get("content", "")
+            if tx.strip(): final_reply = final_reply if final_reply and m is not msgs[-1] else tx
+    uts = user_turns(d)
+    corrections = [t for _, t, _ in uts[1:] if CORRECTION.search(t[:300])]
+    stamps = [x for x in (ts(m) for m in msgs) if x]
+    active = 0.0
+    for a, b in zip(stamps, stamps[1:]):
+        g = (b - a).total_seconds()
+        if 0 < g < 600: active += g
+    total_tools = sum(tools.values())
+    cited = sorted({p for p in re.findall(r"\*\*([A-Z][A-Za-z ,'-]+?)\*\*", final_reply)})
+    return {
+        "id": d.get("id"), "title": (d.get("title") or "")[:80], "kind": kind,
+        "worker": bool(d.get("is_swarm_worker")), "parent": d.get("parent_id"),
+        "model": d.get("model"), "provider": d.get("provider_key"), "effort": d.get("reasoning_effort"),
+        "cwd": d.get("working_dir"), "created": d.get("created_at"),
+        "active_min": round(active / 60, 1), "messages": len(msgs),
+        "user_turns": len(uts), "corrections": len(corrections),
+        "tool_calls": total_tools, "tools": dict(tools.most_common(12)),
+        "tool_errors": sum(errors.values()), "errors_by_tool": dict(errors.most_common(6)),
+        "verify_calls": verify_calls, "runtime_verify_calls": runtime_calls, "verify_skill_cli": verify_cli,
+        "verify_share": round(verify_calls / total_tools, 3) if total_tools else 0,
+        "spawns": len(spawns), "spawn_fail": spawn_fail, "spawn_models": dict(spawn_models),
+        "worker_md_first_line": worker_first_line,
+        "harness_read": harness_read, "principles_read": sorted(principles), "playbooks_read": sorted(playbooks),
+        "todo_calls": todo_calls, "asks": asks,
+        "edits_deterministic": edits_det, "edits_descriptive": edits_desc, "edits_other": edits_other,
+        "commits": commits, "pushes": pushes,
+        "compactions": 1 if d.get("compaction") else 0,
+        "tok_in": tok_in, "tok_out": tok_out, "tok_cache_read": tok_cache,
+        "em_dash_in_replies": em_dash, "final_reply_lines": final_reply.count("\n") + 1 if final_reply else 0,
+        "final_reply_bold_terms": cited[:12],
+    }, [(d.get("id"), i, t[:1500], bool(CORRECTION.search(t[:300]))) for i, t, _ in uts]
+
+
+def pct(n, d):
+    return f"{100 * n / d:.0f}%" if d else "n/a"
+
+
+def med(xs):
+    return statistics.median(xs) if xs else 0
+
+
+def summarize(rows):
+    L = []
+    for label, sub in (("coordinators", [r for r in rows if not r["worker"]]), ("workers", [r for r in rows if r["worker"]])):
+        n = len(sub)
+        if not n: continue
+        tc = sum(r["tool_calls"] for r in sub)
+        L += [f"## {label} ({n} sessions)", "",
+              "| Criterion (author) | Metric | Value |", "|---|---|---|",
+              f"| Verification is the core loop | sessions with any verification call | {pct(sum(r['verify_calls'] > 0 for r in sub), n)} |",
+              f"| | sessions with runtime verification (not just compile/test) | {pct(sum(r['runtime_verify_calls'] > 0 for r in sub), n)} |",
+              f"| | sessions driving the repo verification CLI (verify-jcode) | {pct(sum(r['verify_skill_cli'] > 0 for r in sub), n)} |",
+              f"| | sessions that edited code and pushed with no runtime verification | {sum(r['edits_other'] > 0 and r['pushes'] > 0 and r['runtime_verify_calls'] == 0 for r in sub)} |",
+              f"| | verification share of all tool calls | {pct(sum(r['verify_calls'] for r in sub), tc)} |",
+              f"| Human is not the bottleneck | median user turns per session | {med([r['user_turns'] for r in sub])} |",
+              f"| | sessions with a correction from the user | {pct(sum(r['corrections'] > 0 for r in sub), n)} |",
+              f"| | corrections per session (mean) | {sum(r['corrections'] for r in sub) / n:.2f} |",
+              f"| | median tool calls per user turn | {med([r['tool_calls'] / max(r['user_turns'], 1) for r in sub]):.1f} |",
+              f"| Coordinator delegates | sessions that spawned workers | {pct(sum(r['spawns'] > 0 for r in sub), n)} |",
+              f"| | spawns / failed spawns | {sum(r['spawns'] for r in sub)} / {sum(r['spawn_fail'] for r in sub)} |",
+              f"| | spawns whose first line is `Read .../worker.md` | {pct(sum(r['worker_md_first_line'] for r in sub), sum(r['spawns'] for r in sub))} |",
+              f"| Encode lessons in structure | edits to deterministic files (tests, checks, lint, hooks) | {sum(r['edits_deterministic'] for r in sub)} |",
+              f"| | edits to descriptive files (AGENTS.md, skills, md) | {sum(r['edits_descriptive'] for r in sub)} |",
+              f"| | edits to other code | {sum(r['edits_other'] for r in sub)} |",
+              f"| Coordinator delegates | own code edits in sessions that also spawned workers (median) | {med([r['edits_other'] for r in sub if r['spawns']])} |",
+              f"| Protocol (poteto-mode) | read jcode harness doc | {pct(sum(r['harness_read'] > 0 for r in sub), n)} |",
+              f"| | read any principle leaf | {pct(sum(bool(r['principles_read']) for r in sub), n)} |",
+              f"| | read any playbook | {pct(sum(bool(r['playbooks_read']) for r in sub), n)} |",
+              f"| | used todo | {pct(sum(r['todo_calls'] > 0 for r in sub), n)} |",
+              f"| | replies containing em dashes (unslop) | {pct(sum(r['em_dash_in_replies'] > 0 for r in sub), n)} |",
+              f"| Ship | sessions with a commit / a push | {pct(sum(r['commits'] > 0 for r in sub), n)} / {pct(sum(r['pushes'] > 0 for r in sub), n)} |",
+              f"| Context and cost | sessions compacted | {pct(sum(r['compactions'] > 0 for r in sub), n)} |",
+              f"| | tool error rate | {pct(sum(r['tool_errors'] for r in sub), tc)} |",
+              f"| | output tokens total / median per session | {sum(r['tok_out'] for r in sub):,} / {med([r['tok_out'] for r in sub]):,} |",
+              f"| | active hours total | {sum(r['active_min'] for r in sub) / 60:.1f} |", ""]
+        L += ["Models: " + ", ".join(f"{k} {v}" for k, v in collections.Counter(f"{r['provider']}:{r['model']}" for r in sub).most_common()), ""]
+        pr = collections.Counter(p for r in sub for p in r["principles_read"])
+        pb = collections.Counter(p for r in sub for p in r["playbooks_read"])
+        L += ["Principles read: " + ", ".join(f"{k} {v}" for k, v in pr.most_common()), "",
+              "Playbooks read: " + ", ".join(f"{k} {v}" for k, v in pb.most_common()), ""]
+        em = collections.Counter()
+        for r in sub:
+            for k, v in r["errors_by_tool"].items(): em[k] += v
+        L += ["Errors by tool: " + ", ".join(f"{k} {v}" for k, v in em.most_common(10)), ""]
+        sm = collections.Counter()
+        for r in sub:
+            for k, v in r["spawn_models"].items(): sm[k] += v
+        L += ["Spawn models: " + ", ".join(f"{k} {v}" for k, v in sm.most_common()), ""]
+    return "\n".join(L)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--sessions", default=os.path.expanduser("~/.jcode/sessions"))
+    ap.add_argument("--since", default="2026-11-01")
+    ap.add_argument("--out", default=os.path.expanduser("~/.jcode/pstack-audit"))
+    a = ap.parse_args()
+    os.makedirs(a.out, exist_ok=True)
+    rows = []; turns = []; global_seen = set()
+    files = []
+    for f in glob.glob(os.path.join(a.sessions, "session_*.json")):
+        if os.path.getsize(f) >= 2000:
+            files.append((int(re.search(r"_(\d{13})_", f).group(1)) if re.search(r"_(\d{13})_", f) else 0, f))
+    for _, f in sorted(files):
+        d = load(f, global_seen)
+        if not d or (d.get("created_at") or "") < a.since: continue
+        kind = is_poteto(d)
+        if not kind or not d["messages"]: continue
+        r, ut = analyze(f, d, kind)
+        rows.append(r); turns += ut
+    with open(os.path.join(a.out, "sessions.jsonl"), "w") as o:
+        for r in rows: o.write(json.dumps(r, ensure_ascii=False) + "\n")
+    with open(os.path.join(a.out, "user_turns.jsonl"), "w") as o:
+        for sid, i, t, c in turns: o.write(json.dumps({"session": sid, "idx": i, "correction": c, "text": t}, ensure_ascii=False) + "\n")
+    s = f"# poteto-mode session audit\n\nGenerated {dt.datetime.now():%F %T}, since {a.since}, {len(rows)} sessions.\n\n" + summarize(rows)
+    open(os.path.join(a.out, "summary.md"), "w").write(s)
+    print(s)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

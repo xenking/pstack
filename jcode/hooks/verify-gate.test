@@ -36,4 +36,10 @@ check 0 $J 'git push origin HEAD:master' "user skip file passes"
 rm -f "$T/skip"
 mkdir -p "$T/ev/desk"; jq -n --arg h "$(git -C $J rev-parse HEAD)" --arg r "$J" '{schema:1,phase:"cleaned",sources:{($r):{head:$h}}}' > "$T/ev/desk/run.json"; echo '{"journey":"tools","passed":true}' > "$T/ev/desk/tools-proof.json"
 check 0 $J 'git push origin HEAD:master' "desktop-shaped receipt passes"
+mv "$T/ev/desk" "$T/ev/older passing receipt"
+touch -t 202001010000 "$T/ev/older passing receipt/run.json"
+receipt newest "$(git -C $J rev-parse HEAD~2)" passed
+check 0 $J 'git push origin HEAD:master' "a newer incomplete receipt does not hide an older covering receipt"
+echo '{"journey":"tools","passed":false}' > "$T/ev/older passing receipt/tools-proof.json"
+check 2 $J 'git push origin HEAD:master' "old failed and new incomplete receipts both block"
 [ $fail = 0 ] && echo "all pass"; exit $fail

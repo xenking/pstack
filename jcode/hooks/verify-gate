@@ -15,19 +15,34 @@ printf '%s' "$STRIPPED" | grep -qE '(^|[;&|(]|\n)[[:space:]]*git([[:space:]]+-C[
 [ -e "$SKIP" ] && exit 0
 block() { echo "BLOCKED by verify-gate: $1" >&2; exit 2; }
 
-receipt_heads() {
-  local top=$1 run dir
-  { IFS=:; for r in $ROOTS; do ls -d "$r"/*/run.json 2>/dev/null; done; ls -d "$top"/target/*/run.json 2>/dev/null; } | while read -r run; do
-    dir=$(dirname "$run")
+receipt_covers() {
+  local top=$1 repo=$2 files=$3 run dir h heads physical_top r checked=$'\n'
+  physical_top=$(cd "$top" && pwd -P)
+  while IFS= read -r run; do
+    dir=${run%/*}
+    heads=""
     if jq -e '.cleaned == true' "$run" >/dev/null 2>&1 \
       && cat "$dir"/drive-*.json 2>/dev/null | jq -se 'map(select(.status=="passed")) | length > 0' >/dev/null 2>&1; then
-      jq -r '.repo_head // empty' "$run"
+      heads=$(jq -r '.repo_head // empty' "$run")
     fi
     if jq -e '.phase == "cleaned"' "$run" >/dev/null 2>&1 \
       && cat "$dir"/*-proof.json 2>/dev/null | jq -se 'map(select(.passed==true)) | length > 0' >/dev/null 2>&1; then
-      jq -r --arg t "$top" --arg r "$(cd "$top" && pwd -P)" '.sources | to_entries[] | select(.key == $t or .key == $r or (.key|sub("^/private";"")) == ($t|sub("^/private";""))) | .value.head // empty' "$run"
+      heads+=$'\n'$(jq -r --arg t "$top" --arg r "$physical_top" '.sources | to_entries[] | select(.key == $t or .key == $r or (.key|sub("^/private";"")) == ($t|sub("^/private";""))) | .value.head // empty' "$run")
     fi
-  done
+    for h in $heads; do
+      [[ $checked == *$'\n'"$h"$'\n'* ]] && continue
+      checked+="$h"$'\n'
+      git -C "$repo" cat-file -e "$h^{commit}" 2>/dev/null || continue
+      # shellcheck disable=SC2086
+      git -C "$repo" diff --quiet "$h" HEAD -- $files && return 0
+    done
+  done < <(
+    local -a runs=()
+    IFS=:
+    for r in $ROOTS; do runs+=("$r"/*/run.json); done
+    ls -1dt "${runs[@]}" "$top"/target/*/run.json 2>/dev/null
+  )
+  return 1
 }
 
 dir="${JCODE_HOOK_CWD:-$PWD}"
@@ -49,12 +64,6 @@ while IFS= read -r seg || [ -n "$seg" ]; do
   [ -n "$base" ] || block "cannot find the upstream of $top to compute what this push changes. Fetch first."
   files=$(git -C "$repo" diff --name-only "$base" HEAD -- . ':(exclude)*.md' ':(exclude).jcode/skills/**')
   [ -n "$files" ] || continue
-  ok=""
-  for h in $(receipt_heads "$top" | sort -u); do
-    git -C "$repo" cat-file -e "$h^{commit}" 2>/dev/null || continue
-    # shellcheck disable=SC2086
-    if git -C "$repo" diff --quiet "$h" HEAD -- $files; then ok=$h; break; fi
-  done
-  [ -n "$ok" ] || block "push to $url changes code ($(echo "$files" | head -3 | tr '\n' ' ')...) with no passing verify receipt covering it. Run /verify-jcode (or /verify-jcode-desktop) on HEAD, drive the changed feature, clean up, then push. Docs-only pushes are exempt."
+  receipt_covers "$top" "$repo" "$files" || block "push to $url changes code ($(echo "$files" | head -3 | tr '\n' ' ')...) with no passing verify receipt covering it. Run /verify-jcode (or /verify-jcode-desktop) on HEAD, drive the changed feature, clean up, then push. Docs-only pushes are exempt."
 done < <(printf '%s' "$STRIPPED" | perl -pe 's/(&&|\|\||[;&|(\n])/\n/g')
 exit 0
