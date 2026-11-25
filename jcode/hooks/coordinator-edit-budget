@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""jcode pre_tool gate. Warn on the 6th counted call, block on the 21st."""
+
+import fcntl
+import json
+import mmap
+import os
+from pathlib import Path
+import re
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+EDIT_TOOLS = {"edit", "write", "apply_patch"}
+ROLE_KEYS = (b'"is_swarm_worker"', b'"pinned_skill"', b'"pinned_skills"')
+STRING = rb'"[^"\\]*(?:\\.[^"\\]*)*"'
+TOKENS = re.compile(rb'(?P<key>' + b"|".join(ROLE_KEYS) + rb')(?=\s*:)'
+                    + rb'|' + STRING + rb'|[{}\[\]]')
+VALUE = re.compile(rb'\s*:\s*(true|false|null|' + STRING + rb'|\[[^\]]*\])')
+CODEX_PATH = re.compile(r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)$", re.M)
+UNIFIED_PATHS = re.compile(r"^--- (.+)\n\+\+\+ (.+)$", re.M)
+
+
+def snapshot_role(snapshot):
+    # Inspect only the three Session fields. Start at the first possible key,
+    # not at the beginning of the transcript. Determine root depth from EOF
+    # so a nested tool argument with the same name is not session metadata.
+    with mmap.mmap(snapshot.fileno(), 0, access=mmap.ACCESS_READ) as data:
+        starts = []
+        for key in ROLE_KEYS:
+            start = data.find(key)
+            while start > 0 and data[start - 1] == ord("\\"):
+                start = data.find(key, start + len(key))
+            if start >= 0:
+                starts.append(start)
+        if not starts:
+            return "other"
+        fields = {}
+        depth = 0
+        for token in TOKENS.finditer(data, min(starts)):
+            if token.lastgroup == "key":
+                value = VALUE.match(data, token.end())
+                if value:
+                    fields[depth, token["key"]] = value.span(1)
+            elif token.end() - token.start() == 1:
+                depth += 1 if data[token.start()] in b"[{" else -1
+
+        def get(key):
+            start, end = fields.get((depth + 1, key), (0, 0))
+            return json.loads(data[start:end]) if start != end else None
+
+        if get(ROLE_KEYS[0]) is True:
+            return "worker"
+        modes = get(ROLE_KEYS[2]) or [get(ROLE_KEYS[1])]
+        return "coordinator" if "poteto-mode" in modes else "other"
+
+
+def read_input():
+    # The env mirror may be truncated. stdin is the full tool input.
+    raw = sys.stdin.buffer.read()
+    if not raw:
+        raw = os.environ.get("JCODE_HOOK_TOOL_INPUT") or json.loads(
+            os.environ.get("JCODE_HOOK_PAYLOAD", "{}")
+        ).get("tool_input", "{}")
+    return json.loads(raw)
+
+
+def paths(tool, args):
+    if tool != "apply_patch":
+        if isinstance(path := args.get("file_path"), str) and path:
+            yield path
+        return
+    patch = args.get("patch_text", "").replace("\r\n", "\n")
+    if any(line.strip() == "*** Begin Patch" for line in patch.split("\n")):
+        for match in CODEX_PATH.finditer(patch):
+            yield match[1].strip()
+    else:
+        for match in UNIFIED_PATHS.finditer(patch):
+            old, new = (header.split("\t", 1)[0] for header in match.groups())
+            yield old.removeprefix("a/") if new == "/dev/null" else new.removeprefix("b/")
+
+
+def conflicted(path):
+    try:
+        if not path.is_file():
+            return False
+        with path.open("rb") as file:
+            stage = 0
+            for line in file:
+                marker = line.rstrip(b"\r\n").partition(b" ")[0].partition(b"\t")[0]
+                if len(marker) < 7:
+                    continue
+                if not marker.strip(b"<"):
+                    stage = 1
+                elif stage == 1 and not marker.strip(b"="):
+                    stage = 2
+                elif stage == 2 and not marker.strip(b">"):
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def countable(tool, args, cwd, exempt):
+    in_repo = {}
+    for name in set(paths(tool, args)):
+        if not name or "\0" in name:
+            continue
+        path = (cwd / name).resolve()
+        if any(path.is_relative_to(root) for root in exempt):
+            continue
+        parent = path.parent
+        while not parent.is_dir() and parent != parent.parent:
+            parent = parent.parent
+        if parent not in in_repo:
+            result = subprocess.run(
+                ["git", "-C", str(parent), "rev-parse", "--is-inside-work-tree"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=0.5,
+            )
+            in_repo[parent] = result.returncode == 0 and result.stdout.strip() == b"true"
+        if in_repo[parent] and not conflicted(path):
+            return True
+    return False
+
+
+def save_state(path, state):
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as file:
+        try:
+            json.dump(state, file)
+            file.close()
+            os.replace(file.name, path)
+        finally:
+            Path(file.name).unlink(missing_ok=True)
+
+
+def load_state(path, metadata):
+    try:
+        state = json.loads(path.read_text())
+    except (FileNotFoundError, ValueError):
+        state = {}
+    with metadata.open("rb") as snapshot:
+        info = os.fstat(snapshot.fileno())
+        if not stat.S_ISREG(info.st_mode) or not info.st_size:
+            return state, False, "other"
+        fingerprint = [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns]
+        changed = state.get("snapshot") != fingerprint
+        if changed:
+            state.update(snapshot=fingerprint, role=snapshot_role(snapshot))
+    return state, changed, state["role"]
+
+
+def main():
+    tool = os.environ.get("JCODE_HOOK_TOOL_NAME", "").lower()
+    session = os.environ.get("JCODE_HOOK_SESSION_ID", "")
+    if tool not in EDIT_TOOLS or not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", session):
+        return 0
+    home = Path.home()
+    jcode = Path(os.environ.get("JCODE_HOME") or home / ".jcode")
+    state_dir = jcode / "hooks-state"
+    if (state_dir / f"{session}.allow-edits").exists():
+        return 0
+    metadata = jcode / "sessions" / f"{session}.json"
+    if not metadata.is_file():
+        return 0
+
+    # Serialize parallel edit calls for this session only. Update the cache
+    # when jcode replaces the snapshot, including after a mode change.
+    os.umask(0o077)
+    state_dir.mkdir(exist_ok=True)
+    state_path = state_dir / f"{session}.coordinator-edit-budget.json"
+    with state_path.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state, changed, role = load_state(state_path, metadata)
+        count = 0
+        if role == "coordinator" and countable(
+            tool, read_input(), Path(os.environ.get("JCODE_HOOK_CWD") or os.getcwd()),
+            ((jcode / "scratch").resolve(), (home / ".jcode/scratch").resolve(),
+             (home / ".agents").resolve()),
+        ):
+            count = state.get("count", 0) + 1
+            if count <= 20:
+                state["count"] = count
+                changed = True
+        if changed:
+            save_state(state_path, state)
+
+    if count < 6:
+        return 0
+    skill = home / ".jcode/skills/poteto-mode"
+    delegate = (
+        f"Delegate via swarm spawn. Put this on the first line of the worker brief:\n"
+        f"Read {skill / 'worker.md'} before anything else.\n"
+        "Name the goal, exact scope and file paths, success checks, and what to report. "
+        f"Give each worker its own writable scope. For a poteto-agent, include {skill / 'SKILL.md'}."
+    )
+    if count >= 21:
+        print(f"BLOCKED by coordinator-edit-budget: 20 direct repository edit calls used. {delegate}",
+              file=sys.stderr)
+        return 2
+    msg = f"coordinator-edit-budget: {count}/20 direct repository edit calls used. {delegate}"
+    print(json.dumps({"hookSpecificOutput": {"additionalContext": msg}}))
+    return 0
+
+
+if __name__ == "__main__":
+    # Leave room for jcode's 5s deadline even on unusual files or contention.
+    signal.alarm(4)
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, AttributeError, TypeError, subprocess.TimeoutExpired):
+        sys.exit(0)

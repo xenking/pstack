@@ -1,0 +1,108 @@
+#!/bin/bash
+# Regression cases. Exit 0 = all pass.
+set -eu
+H=$(cd "$(dirname "$0")" && pwd)/coordinator-edit-budget
+T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+export HOME="$T/home" JCODE_HOME="$T/home/.jcode" JCODE_HOOK_CWD="$T/repo"
+S="$JCODE_HOME/sessions"
+mkdir -p "$S" "$JCODE_HOME/scratch" "$HOME/.agents" "$T/outside"
+git init -q "$JCODE_HOOK_CWD"
+git init -q "$JCODE_HOME/scratch"
+git init -q "$HOME/.agents"
+printf '<<<<<<< HEAD\nold\n||||||| base\nbase\n=======\nnew\n>>>>>>> topic\n' > "$JCODE_HOOK_CWD/conflict.rs"
+printf '<<<<<<< one marker only\n' > "$JCODE_HOOK_CWD/normal.rs"
+
+snapshot() { printf '%s\n' "$2" > "$S/new"; mv "$S/new" "$S/$1.json"; }
+snapshot root '{"messages":[{"is_swarm_worker":true,"pinned_skills":["swarm"]}],"pinned_skill":"swarm","pinned_skills":["swarm","poteto-mode"],"nested":{"pinned_skills":["other"]}}'
+snapshot worker '{"messages":[],"pinned_skill":"poteto-mode","is_swarm_worker":true}'
+snapshot inactive '{"messages":[{"pinned_skills":["poteto-mode"],"text":"Active mode: poteto-mode"}],"pinned_skills":["other"]}'
+snapshot legacy '{"parent_id":"root","messages":[],"pinned_skill":"poteto-mode"}'
+snapshot parallel '{"messages":[],"pinned_skills":["poteto-mode"]}'
+
+invoke() {
+    local id=$1 tool=$2 input=$3 mirror envelope
+    mirror=${input:0:16384}
+    envelope=$(jq -nc --arg id "$id" --arg tool "$tool" --arg cwd "$JCODE_HOOK_CWD" --arg input "$mirror" \
+        '{event:"pre_tool",session_id:$id,cwd:$cwd,tool_name:$tool,tool_input:$input}')
+    printf '%s' "$input" | JCODE_HOOK_EVENT=pre_tool JCODE_HOOKS_DISABLED=1 \
+        JCODE_HOOK_SESSION_ID="$id" JCODE_HOOK_TOOL_NAME="$tool" JCODE_HOOK_TOOL_INPUT="$mirror" \
+        JCODE_HOOK_PAYLOAD="$envelope" "$H"
+}
+
+checks=0
+check() {
+    local want=$1 id=$2 tool=$3 input=$4 got=0 context
+    checks=$((checks+1))
+    invoke "$id" "$tool" "$input" > "$T/out" 2> "$T/err" || got=$?
+    case "$want" in
+        quiet) [ "$got" = 0 ] && [ ! -s "$T/out" ] && [ ! -s "$T/err" ] && return ;;
+        block) [ "$got" = 2 ] && [ ! -s "$T/out" ] \
+            && grep -qF 'Delegate via swarm spawn' "$T/err" \
+            && grep -qxF "Read $HOME/.jcode/skills/poteto-mode/worker.md before anything else." "$T/err" && return ;;
+        *) context=$(jq -r '.hookSpecificOutput.additionalContext // empty' "$T/out")
+            [ "$got" = 0 ] && [ ! -s "$T/err" ] \
+                && [[ $context == *"$want/20 direct repository edit calls used"* ]] && return ;;
+    esac
+    printf 'FAIL check %s %s %s: expected %s, got exit %s\n' "$checks" "$id" "$tool" "$want" "$got" >&2
+    cat "$T/out" "$T/err" >&2
+    exit 1
+}
+
+edit='{"file_path":"normal.rs","edits":[{"old_string":"one","new_string":"two"}]}'
+write='{"file_path":"missing/deep/file.rs","content":"a"}'
+conflict='{"file_path":"conflict.rs","content":"resolved"}'
+codex='{"patch_text":"*** Begin Patch\n*** Add File: one.rs\n+one\n*** Add File: two.rs\n+two\n*** End Patch"}'
+unified='{"patch_text":"--- a/normal.rs\t2026-01-01\n+++ /dev/null\n@@ -1 +0,0 @@\n-<<<<<<< one marker only\n"}'
+
+for n in {1..5}; do check quiet root edit "$edit"; done
+check 6 root write "$write"
+check 7 root apply_patch "$codex"
+check 8 root apply_patch "$unified"
+for n in {9..20}; do check "$n" root edit "$edit"; done
+check block root edit "$edit"
+check block root write "$write"
+check quiet root write "$conflict"
+check quiet root apply_patch '{"patch_text":"*** Begin Patch\n*** Delete File: conflict.rs\n*** End Patch"}'
+check block root apply_patch '{"patch_text":"*** Begin Patch\n*** Update File: conflict.rs\n*** Move to: renamed.rs\n*** End Patch"}'
+check block root apply_patch "$codex"
+check quiet root read "$edit"
+check quiet root write "{\"file_path\":\"$T/outside/new.rs\"}"
+check quiet root write "{\"file_path\":\"$JCODE_HOME/scratch/new.rs\"}"
+check quiet root write "{\"file_path\":\"$HOME/.agents/new.rs\"}"
+ln -s "$T/outside" "$JCODE_HOOK_CWD/link"
+check quiet root write '{"file_path":"link/new.rs"}'
+check quiet missing edit "$edit"
+check quiet '../root' edit "$edit"
+
+# Full stdin must win over the truncated env mirror, even when only a late
+# file in a multi-file patch counts.
+large=$(jq -nc --arg path "$T/outside/new.rs" '{patch_text:("*** Begin Patch\n*** Add File: " + $path + "\n+" + ("x" * 17000) + "\n*** Add File: guarded.rs\n+y\n*** End Patch")}')
+check block root apply_patch "$large"
+
+touch "$JCODE_HOME/hooks-state/root.allow-edits"
+check quiet root edit "$edit"
+rm "$JCODE_HOME/hooks-state/root.allow-edits"
+check block root edit "$edit"
+for n in {1..22}; do
+    check quiet worker edit "$edit"
+    check quiet inactive edit "$edit"
+done
+for n in {1..5}; do check quiet legacy edit "$edit"; done
+check 6 legacy edit "$edit"
+
+snapshot root '{"messages":[{"pinned_skill":"poteto-mode"}]}'
+check quiet root edit "$edit"
+snapshot root '{"messages":[],"pinned_skills":["poteto-mode"]}'
+check block root edit "$edit"
+
+pids=()
+for n in {1..12}; do
+    invoke parallel edit "$edit" > "$T/parallel.$n" 2> "$T/parallel.err.$n" &
+    pids+=("$!")
+done
+for pid in "${pids[@]}"; do wait "$pid"; done
+for n in {6..12}; do
+    [ "$(grep -Fl " $n/20 direct repository edit calls used" "$T"/parallel.* | wc -l)" -eq 1 ]
+done
+check 13 parallel edit "$edit"
+printf 'all pass (%s sequential checks, 12 parallel calls)\n' "$checks"
